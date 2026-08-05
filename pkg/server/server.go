@@ -204,6 +204,12 @@ func (s *Server) GetConfig() Configuration {
 	return s.currentConfig
 }
 
+// GetConfigErrors returns accumulated configuration errors.
+// Currently returns nil as config validation errors are handled inline.
+func (s *Server) GetConfigErrors() []string {
+	return nil
+}
+
 // GetConfigVersion returns the current configuration version for monitoring.
 func (s *Server) GetConfigVersion() uint64 {
 	return s.configVersion.Load()
