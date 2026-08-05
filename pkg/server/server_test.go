@@ -9,6 +9,60 @@ import (
 	"time"
 )
 
+// --- Test helpers ---
+
+// newTestServer creates a Server, starts the configuration watcher,
+// and registers cleanup to cancel the context when the test finishes.
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	s := NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	s.Start(ctx)
+	return s
+}
+
+// routerConfig builds a Configuration with a single router and middleware.
+func routerConfig(path, body, header string) Configuration {
+	return Configuration{
+		Routers: map[string]RouterConfig{
+			"route1": {
+				Path:         path,
+				Middleware:   "mw",
+				ResponseText: body,
+			},
+		},
+		Middlewares: map[string]MiddlewareConfig{
+			"mw": {
+				HeaderName:  "X-Test-Header",
+				HeaderValue: header,
+			},
+		},
+	}
+}
+
+// waitFor polls cond every 10ms until it returns true or timeout expires.
+func waitFor(t *testing.T, timeout time.Duration, desc string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", desc)
+}
+
+// get performs an HTTP request against the EntryPoint's handler and returns
+// the recorded response.
+func get(ep *EntryPoint, path string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	ep.ServeHTTP(rec, req)
+	return rec
+}
+
 // TestConcurrentConfigurationUpdates verifies that the handler chain remains
 // consistent during concurrent provider updates. The response body and
 // middleware headers must always agree (both "Old" or both "New").
