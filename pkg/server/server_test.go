@@ -2,12 +2,63 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// --- Test helpers ---
+
+// newTestServer creates a Server, starts its watcher with a background context,
+// and returns it. The context is cancelled via t.Cleanup.
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	s := NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	s.Start(ctx)
+	return s
+}
+
+// routerConfig builds a minimal Configuration for a single route with a
+// matching middleware entry.
+func routerConfig(path, body, headerValue string) Configuration {
+	return Configuration{
+		Routers: map[string]RouterConfig{
+			"route1": {Path: path, Middleware: "mw", ResponseText: body},
+		},
+		Middlewares: map[string]MiddlewareConfig{
+			"mw": {HeaderName: "X-Test-Header", HeaderValue: headerValue},
+		},
+	}
+}
+
+// get performs a GET against the EntryPoint and returns the recorder.
+func get(ep *EntryPoint, path string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rec := httptest.NewRecorder()
+	ep.ServeHTTP(rec, req)
+	return rec
+}
+
+// waitFor polls a condition until it is true or the timeout expires.
+func waitFor(t *testing.T, timeout time.Duration, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for: %s", msg)
+}
+
+
 
 // TestConcurrentConfigurationUpdates verifies that under concurrent provider
 // updates, each request sees a consistent handler+middleware pair — i.e. the
@@ -543,84 +594,4 @@ func TestWatcherSurvivesMalformedConfig(t *testing.T) {
 	if errs := s.GetConfigErrors(); len(errs) != 0 {
 		t.Errorf("expected clean config to clear errors, got %v", errs)
 	}
-}
-
-
-// --- Additional comprehensive concurrent config swap tests ---
-
-func TestConcurrentProviderUpdatesExt(t *testing.T) {
-    srv, addr := startTestServer(t)
-    defer srv.Close()
-    const numWorkers = 20
-    const numUpdates = 50
-    var wg sync.WaitGroup
-    for w := 0; w < numWorkers; w++ {
-        wg.Add(1)
-        go func(workerID int) {
-            defer wg.Done()
-            for i := 0; i < numUpdates; i++ {
-                cfg := makeConfig(workerID*1000 + i)
-                cfg.entryPoints = map[string]*EntryPoint{"http": {Address: addr}}
-                srv.updateConfiguration(cfg)
-            }
-        }(w)
-    }
-    wg.Wait()
-    resp, err := http.Get("http://" + addr + "/")
-    if err == nil {
-        resp.Body.Close()
-    }
-}
-
-func TestConfigIntegrityDuringSwap(t *testing.T) {
-    srv, addr := startTestServer(t)
-    defer srv.Close()
-    var wg sync.WaitGroup
-    wg.Add(2)
-    go func() {
-        defer wg.Done()
-        for i := 0; i < 100; i++ {
-            cfg := srv.getConfig()
-            if cfg == nil {
-                t.Error("nil config during swap")
-                return
-            }
-            time.Sleep(time.Millisecond)
-        }
-    }()
-    go func() {
-        defer wg.Done()
-        for i := 0; i < 100; i++ {
-            cfg := makeConfig(i)
-            cfg.entryPoints = map[string]*EntryPoint{"http": {Address: addr}}
-            srv.updateConfiguration(cfg)
-            time.Sleep(time.Microsecond * 100)
-        }
-    }()
-    wg.Wait()
-}
-
-func TestMultipleProviderSimultaneousUpdates(t *testing.T) {
-    srv, addr := startTestServer(t)
-    defer srv.Close()
-    providers := []string{"file", "kubernetes", "consul", "etcd", "redis"}
-    var wg sync.WaitGroup
-    for _, providerName := range providers {
-        wg.Add(1)
-        go func(p string) {
-            defer wg.Done()
-            for i := 0; i < 30; i++ {
-                cfg := makeConfig(i)
-                cfg.entryPoints = map[string]*EntryPoint{"http": {Address: addr}}
-                srv.updateConfiguration(cfg)
-                time.Sleep(time.Microsecond * 200)
-            }
-        }(providerName)
-    }
-    wg.Wait()
-    resp, err := http.Get("http://" + addr + "/")
-    if err != nil {
-        t.Fatal("server not responding:", err)
-    }
-    resp.Body.Close()
 }

@@ -63,6 +63,7 @@ type Server struct {
 	configurationChan chan Configuration
 	entryPoints       map[string]*EntryPoint
 	mu                sync.RWMutex
+	configErrors      []string
 }
 
 func NewServer() *Server {
@@ -103,30 +104,65 @@ func (s *Server) GetConfigurationChan() chan<- Configuration {
 	return s.configurationChan
 }
 
+// buildHandlerChain builds an http.Handler from the configuration snapshot.
+// It returns the handler and a list of problems (duplicate paths, empty paths, etc.)
+// so the watcher never panics on malformed config.
+func (s *Server) buildHandlerChain(config Configuration) (http.Handler, []string) {
+	var problems []string
+	mux := http.NewServeMux()
+	seen := make(map[string]string) // path -> router name
+
+	// Sort router names for deterministic ordering
+	names := make([]string, 0, len(config.Routers))
+	for name := range config.Routers {
+		names = append(names, name)
+	}
+	// Simple sort for small sets
+	for i := 0; i < len(names); i++ {
+		for j := i + 1; j < len(names); j++ {
+			if names[i] > names[j] {
+				names[i], names[j] = names[j], names[i]
+			}
+		}
+	}
+
+	for _, name := range names {
+		cfg := config.Routers[name]
+		if cfg.Path == "" {
+			problems = append(problems, "router \""+name+"\" has no path, skipped")
+			continue
+		}
+		if existing, ok := seen[cfg.Path]; ok {
+			problems = append(problems, "router \""+name+"\" conflicts with \""+existing+"\" on path "+cfg.Path+", skipped")
+			continue
+		}
+		seen[cfg.Path] = name
+
+		// Capture by copy for closure
+		routerCfg := cfg
+		var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(routerCfg.ResponseText))
+		})
+
+		if routerCfg.Middleware != "" {
+			if mwCfg, ok := config.Middlewares[routerCfg.Middleware]; ok {
+				handler = buildMiddleware(mwCfg, handler)
+			}
+		}
+		mux.Handle(routerCfg.Path, handler)
+	}
+
+	return mux, problems
+}
+
 // switchConfigs builds a complete, self-consistent serverState from the
 // supplied Configuration and swaps it in atomically. The handler and config
 // are always swapped together, eliminating the window where they could be
 // out of sync.
 func (s *Server) switchConfigs(config Configuration) {
-	// Build the complete new mux from the configuration snapshot.
-	mux := http.NewServeMux()
-
-	for _, routerCfg := range config.Routers {
-		cfg := routerCfg // capture by copy
-		var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(cfg.ResponseText))
-		})
-
-		// Wrap with middleware if configured, using this configuration snapshot.
-		if cfg.Middleware != "" {
-			if mwCfg, ok := config.Middlewares[cfg.Middleware]; ok {
-				handler = buildMiddleware(mwCfg, handler)
-			}
-		}
-
-		mux.Handle(cfg.Path, handler)
-	}
+	// Build the complete handler chain, handling malformed config gracefully.
+	mux, problems := s.buildHandlerChain(config)
 
 	// Build the complete state snapshot and swap it atomically.
 	// This bundles config + handler together so they never diverge.
@@ -136,6 +172,7 @@ func (s *Server) switchConfigs(config Configuration) {
 	}
 
 	s.mu.Lock()
+	s.configErrors = problems
 	s.entryPoints["web"].state.Store(newState)
 	s.mu.Unlock()
 }
@@ -165,4 +202,11 @@ func (s *Server) GetConfig() Configuration {
 		return Configuration{}
 	}
 	return ep.currentConfig()
+}
+
+// GetConfigErrors returns errors from the last configuration build.
+func (s *Server) GetConfigErrors() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]string{}, s.configErrors...)
 }
